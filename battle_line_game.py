@@ -1,4 +1,3 @@
-# battle_line_game.py
 import random
 from itertools import groupby
 import numpy as np
@@ -6,6 +5,19 @@ import numpy as np
 # Constants for cards and colors
 COLORS = ['red', 'blue', 'green']
 NUM_VALUES = 10
+
+def card_to_onehot(card):
+    """
+    Convert a card to a one-hot vector of length 30:
+    Index = color_index * 10 + (value - 1)
+    For example, red 1 => index 0, blue 10 => index 29, etc.
+    """
+    vec = np.zeros(30, dtype=np.int32)
+    color_idx = COLORS.index(card.color)
+    val_idx = card.value - 1
+    index = color_idx * NUM_VALUES + val_idx
+    vec[index] = 1
+    return vec
 
 class Card:
     def __init__(self, color, value):
@@ -18,7 +30,9 @@ class Card:
     def encode(self):
         """
         Encode a card as an integer in the range 1..30.
-        Calculation: color_index * NUM_VALUES + value.
+        Calculation: color_index * NUM_VALUES + value
+        (We keep this method for backward compatibility;
+         for RL, we'll use card_to_onehot() in get_state_vector().)
         """
         return COLORS.index(self.color) * NUM_VALUES + self.value
 
@@ -34,6 +48,11 @@ def evaluate_hand(cards):
       1: High Card
     The returned tuple is constructed so that higher tuples compare as stronger.
     """
+    if len(cards) < 3:
+        # If less than 3 cards, we can't evaluate a standard formation,
+        # so just return something very low to indicate incomplete set.
+        return (0, 0)
+
     values = sorted([card.value for card in cards])
     colors = [card.color for card in cards]
     # Trio
@@ -67,12 +86,17 @@ def evaluate_hand(cards):
 
 class Flag:
     def __init__(self):
-        # Each flag has two lists (one per player) for up to 3 cards each.
         self.slots = {"player": [], "opponent": []}
+        self.winner = None  # Flag is locked once winner is determined
 
     def add_card(self, player, card):
+        if self.winner is not None:
+            return False  # Flag already decided
         if len(self.slots[player]) < 3:
             self.slots[player].append(card)
+            # Check if flag is now complete:
+            if self.is_complete():
+                self.winner = self.get_winner()
             return True
         return False
 
@@ -112,14 +136,14 @@ class GameState:
     def available_actions(self, player):
         """
         Return a list of valid actions for the given player.
-        An action is represented as (card_index, flag_index), where:
-          - card_index is the index in the player's hand.
-          - flag_index is the flag (0 to 8) where the card will be placed.
-        Only flags that have fewer than 3 cards for that player are allowed.
+        An action is (card_index, flag_index).
+        Skip flags that are decided or full for that player.
         """
         actions = []
         for i in range(len(self.hands[player])):
             for flag_index, flag in enumerate(self.flags):
+                if flag.winner is not None:
+                    continue  # Skip already decided flags
                 if len(flag.slots[player]) < 3:
                     actions.append((i, flag_index))
         return actions
@@ -130,15 +154,21 @@ class GameState:
         Returns True if the move is legal and executed, otherwise False.
         """
         if card_index >= len(self.hands[player]) or flag_index >= len(self.flags):
-            return False  # invalid indices
+            return False
         flag = self.flags[flag_index]
-        if len(flag.slots[player]) >= 3:
-            return False  # flag is already full for this player
+        if flag.winner is not None or len(flag.slots[player]) >= 3:
+            return False
         card = self.hands[player].pop(card_index)
-        flag.add_card(player, card)
-        # Switch turn after a valid move
-        self.current_turn = "opponent" if player == "player" else "player"
-        return True
+        if flag.add_card(player, card):
+            # Draw a new card if available and if hand is below 7 cards
+            if self.deck and len(self.hands[player]) < 7:
+                self.hands[player].append(self.deck.pop())
+            self.current_turn = "opponent" if player == "player" else "player"
+            return True
+        else:
+            # If move failed, restore the card
+            self.hands[player].insert(card_index, card)
+            return False
 
     def check_game_over(self):
         """
@@ -147,16 +177,17 @@ class GameState:
           - Or if they secure 3 consecutive flags.
         Returns 'player', 'opponent', or None if the game continues.
         """
-        results = []
-        for flag in self.flags:
-            results.append(flag.get_winner())
+        results = [flag.get_winner() for flag in self.flags]
         player_wins = sum(1 for r in results if r == "player")
         opponent_wins = sum(1 for r in results if r == "opponent")
+
+        # 5 flags rule
         if player_wins >= 5:
             return "player"
         if opponent_wins >= 5:
             return "opponent"
-        # Check for 3 consecutive flags won
+
+        # 3 consecutive flags
         for i in range(len(results) - 2):
             window = results[i:i+3]
             if window[0] == window[1] == window[2] == "player":
@@ -174,7 +205,7 @@ class BattleLineGame:
     def step(self, player, card_index, flag_index):
         """
         Execute a move for the current player.
-        Returns (valid_move, winner) after the move.
+        Returns (valid_move, winner).
         """
         valid = self.state.play_move(player, card_index, flag_index)
         self.move_count += 1
@@ -187,7 +218,8 @@ class BattleLineGame:
         """
         print("\n--- Battle Line State ---")
         for i, flag in enumerate(self.state.flags):
-            print(f"Flag {i+1}:")
+            status = f"(Winner: {flag.winner})" if flag.winner else ""
+            print(f"Flag {i+1} {status}:")
             print(f"  Player:   {flag.slots['player']}")
             print(f"  Opponent: {flag.slots['opponent']}")
         print(f"Player hand:   {self.state.hands['player']}")
@@ -197,36 +229,89 @@ class BattleLineGame:
 
     def get_state_vector(self):
         """
-        Create a vector representation of the current state for the RL agent.
-        Representation:
-          - 7 slots for player's hand (card encoded as integer, 0 if empty)
-          - 9 flags x 2 players x 3 slots = 54 entries for board state
-          - 1 entry for current turn (0 for player, 1 for opponent)
-        Total length = 7 + 54 + 1 = 62.
-        """
-        hand_vec = [0] * 7
-        for i, card in enumerate(self.state.hands["player"]):
-            hand_vec[i] = card.encode()
-        board_vec = []
-        for flag in self.state.flags:
-            for side in ["player", "opponent"]:
-                slots = flag.slots[side]
-                slot_codes = [card.encode() for card in slots]
-                while len(slot_codes) < 3:
-                    slot_codes.append(0)
-                board_vec.extend(slot_codes)
-        turn = 0 if self.state.current_turn == "player" else 1
-        return np.array(hand_vec + board_vec + [turn], dtype=np.float32)
+        Returns a one-dimensional binary (one-hot) representation of the entire game state.
 
-    def get_valid_actions(self):
+        Layout:
+          1) Player's hand (7 cards), each card -> 30 bits => 7*30 = 210
+          2) Opponent's hand (7 cards), each card -> 30 bits => 210
+          3) For each of the 9 flags:
+               - Player side: up to 3 cards => 3*30 = 90
+               - Opponent side: up to 3 cards => 90
+               - Flag status: one-hot [not decided, player, opponent] => 3 bits
+            => total per flag = 90 + 90 + 3 = 183
+            => for 9 flags => 9*183 = 1647
+          4) Current turn (1 bit for 'player' or 'opponent'—or 2 bits if you prefer one-hot).
+             We'll use 1 bit: 0 = player, 1 = opponent
+
+        Total = 210 + 210 + 1647 + 1 = 2068
+        """
+        # 1) Player hand
+        player_hand_vecs = []
+        for i in range(7):
+            if i < len(self.state.hands["player"]):
+                onehot = card_to_onehot(self.state.hands["player"][i])
+            else:
+                onehot = np.zeros(30, dtype=np.int32)
+            player_hand_vecs.append(onehot)
+
+        # 2) Opponent hand
+        opp_hand_vecs = []
+        for i in range(7):
+            if i < len(self.state.hands["opponent"]):
+                onehot = card_to_onehot(self.state.hands["opponent"][i])
+            else:
+                onehot = np.zeros(30, dtype=np.int32)
+            opp_hand_vecs.append(onehot)
+
+        # 3) Flags
+        flags_vecs = []
+        for flag in self.state.flags:
+            # Player side
+            for j in range(3):
+                if j < len(flag.slots["player"]):
+                    onehot = card_to_onehot(flag.slots["player"][j])
+                else:
+                    onehot = np.zeros(30, dtype=np.int32)
+                flags_vecs.append(onehot)
+            # Opponent side
+            for j in range(3):
+                if j < len(flag.slots["opponent"]):
+                    onehot = card_to_onehot(flag.slots["opponent"][j])
+                else:
+                    onehot = np.zeros(30, dtype=np.int32)
+                flags_vecs.append(onehot)
+            # Flag status: [not decided, player, opponent]
+            if flag.winner is None:
+                status_vec = np.array([1, 0, 0], dtype=np.int32)
+            elif flag.winner == "player":
+                status_vec = np.array([0, 1, 0], dtype=np.int32)
+            elif flag.winner == "opponent":
+                status_vec = np.array([0, 0, 1], dtype=np.int32)
+            else:
+                status_vec = np.array([0, 0, 0], dtype=np.int32)
+            flags_vecs.append(status_vec)
+
+        # Flatten everything
+        player_hand_flat = np.concatenate(player_hand_vecs)
+        opp_hand_flat = np.concatenate(opp_hand_vecs)
+        flags_flat = np.concatenate(flags_vecs)
+
+        # 4) Current turn bit
+        turn_bit = np.array([1 if self.state.current_turn == "opponent" else 0], dtype=np.int32)
+
+        # Concatenate all
+        state_vec = np.concatenate([player_hand_flat, opp_hand_flat, flags_flat, turn_bit])
+        return state_vec
+
+    def get_valid_actions(self): 
         """
         For the RL agent playing as 'player', encode each action as an integer:
           action = card_index * 9 + flag_index.
         """
         valid = []
         actions = self.state.available_actions("player")
-        for (card_index, flag_index) in actions:
-            valid.append(card_index * 9 + flag_index)
+        for (c_idx, f_idx) in actions:
+            valid.append(c_idx * 9 + f_idx)
         return valid
 
     def decode_action(self, action):
